@@ -1,0 +1,32 @@
+# Dependencies and builds
+node_modules/
+dist/
+
+# Secrets (keep .env.example)
+.env
+.env.*
+!.env.example
+
+# Uploaded files (user content)
+server/uploads/
+uploads/
+
+# Local databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Logs and runtime files
+logs/
+*.log
+npm-debug.log*
+*.pid
+.runtime/
+
+# Editor / tool folders
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

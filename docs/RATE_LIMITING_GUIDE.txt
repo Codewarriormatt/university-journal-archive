@@ -1,0 +1,276 @@
+================================================================================
+  UNIVERSITY JOURNAL ARCHIVE — RATE LIMITING GUIDE
+  For developer and system administrator reference
+  Last updated: May 2026
+================================================================================
+
+This document explains every rate limit applied to the Journal Archive API: which
+endpoints are protected, what the limits are, why they exist, and what happens
+when a limit is exceeded.
+
+Rate limiting is implemented using the `express-rate-limit` npm package.
+All limits are tracked in memory per server process (not persisted to the
+database). Limits reset if the server restarts.
+
+Clients are identified by their IP address. When TRUST_PROXY=true (behind a
+reverse proxy such as Railway or Nginx), the real client IP is used, not the proxy IP.
+
+--------------------------------------------------------------------------------
+HOW RATE LIMIT RESPONSES WORK
+--------------------------------------------------------------------------------
+
+When a limit is exceeded, the server responds with:
+  HTTP status: 429 Too Many Requests
+  Body: { "message": "...", "code": "RATE_LIMITED" }
+
+The response also includes standard rate limit headers (RFC draft-7):
+  RateLimit-Policy   — describes the limit rule
+  RateLimit          — remaining quota and reset time
+
+Clients should check for 429 status and read the message to show the user
+a meaningful explanation. The frontend already handles this for admin login
+(countdown timer) and magic link requests (error message display).
+
+--------------------------------------------------------------------------------
+TIER 1 — GLOBAL BASELINE
+--------------------------------------------------------------------------------
+
+  Applies to:   ALL routes (no exceptions)
+  Limit:        500 requests per 15 minutes per IP
+  File:         server/src/app.js (applied before all routes)
+  Limiter:      globalLimiter
+
+  Purpose:
+    First line of defense against floods, bots, and DDoS attempts.
+    500 requests in 15 minutes (~33/minute) is far more than any normal
+    user will ever need. This limit only triggers automated abuse.
+
+  Error message:
+    "Too many requests. Please slow down and try again later."
+
+--------------------------------------------------------------------------------
+TIER 2 — PUBLIC READ ENDPOINTS
+--------------------------------------------------------------------------------
+
+  Applies to:
+    GET /api/homepage
+    GET /api/records
+    GET /api/articles/:id
+    GET /api/issues/:id
+    GET /api/journals/:id
+
+  Limit:        300 requests per 10 minutes per IP
+  File:         server/src/routes/repositoryRoutes.js
+  Limiter:      publicReadLimiter
+
+  Purpose:
+    Allows heavy browsing and searching without restriction (300 requests
+    in 10 minutes = 30/minute). Stops automated scrapers that try to
+    download the entire catalog in a loop. Legitimate users browsing
+    the site will never come close to this limit.
+
+  Error message:
+    "Too many requests. Please wait a moment before browsing further."
+
+--------------------------------------------------------------------------------
+TIER 3 — PDF DOWNLOAD
+--------------------------------------------------------------------------------
+
+  Applies to:
+    GET /api/downloads/articles/:id/pdf
+
+  Limit:        20 downloads per hour per IP
+  File:         server/src/routes/repositoryRoutes.js
+  Limiter:      pdfDownloadLimiter
+
+  Purpose:
+    Prevents bulk harvesting of PDF files. A researcher downloading 20
+    full papers in one hour is already unusually high. This stops scripts
+    that attempt to scrape every PDF in the repository automatically.
+    Downloads still require authentication for restricted articles —
+    this limit is an additional layer on top.
+
+  Error message:
+    "Download limit reached. You can download up to 20 files per hour."
+
+--------------------------------------------------------------------------------
+TIER 4a — MAGIC LINK REQUEST (BY IP ADDRESS)
+--------------------------------------------------------------------------------
+
+  Applies to:
+    POST /api/auth/reader/request
+
+  Limit:        5 requests per hour per IP address
+  File:         server/src/routes/readerRoutes.js
+  Limiter:      magicLinkIpLimiter
+
+  Purpose:
+    The magic link endpoint triggers an outgoing email. Without a limit,
+    a single script could send thousands of emails from one machine,
+    potentially causing the email provider account to be flagged or
+    suspended. 5 per hour is enough for any legitimate use case (a user
+    who didn't receive their email will retry 2-3 times at most).
+
+  Error message:
+    "Too many sign-in requests from this device. Try again in an hour."
+
+--------------------------------------------------------------------------------
+TIER 4b — MAGIC LINK REQUEST (BY EMAIL ADDRESS)
+--------------------------------------------------------------------------------
+
+  Applies to:
+    POST /api/auth/reader/request (runs after Tier 4a)
+
+  Limit:        3 requests per hour per email address
+  File:         server/src/routes/readerRoutes.js
+  Limiter:      magicLinkEmailLimiter
+
+  Purpose:
+    Prevents targeting a specific person's inbox. Even if an attacker
+    uses different IP addresses (e.g. via VPN), they cannot send more
+    than 3 emails to the same address per hour. This limit runs in
+    addition to the IP-based limit — both must pass for the email to send.
+
+  Key used:     The email address from the POST body (lowercased).
+                Falls back to IP if the email field is missing.
+
+  Error message:
+    "Too many sign-in requests for this email address. Try again in an hour."
+
+--------------------------------------------------------------------------------
+TIER 5 — ADMIN LOGIN (FIRST LAYER)
+--------------------------------------------------------------------------------
+
+  Applies to:
+    POST /api/admin/auth/login
+
+  Limit:        15 requests per 15 minutes per IP
+  File:         server/src/routes/adminRoutes.js
+  Limiter:      adminLoginLimiter
+
+  Purpose:
+    Acts as a fast IP-based block before the second layer (database-tracked
+    per-username limiter) runs. The database limiter tracks failed attempts
+    specifically — this limiter blocks any excessive login traffic by IP
+    regardless of username. Together they form a two-layer defense.
+
+  Two-layer login protection summary:
+    Layer 1 (this):  15 total attempts per 15 min per IP (express-rate-limit)
+    Layer 2:         5 failed attempts per 15 min per username/IP (DB-tracked)
+                     Returns a countdown timer to the client on lockout.
+
+  Error message:
+    "Too many login attempts from this device. Try again in 15 minutes."
+
+--------------------------------------------------------------------------------
+TIER 6 — FILE UPLOADS
+--------------------------------------------------------------------------------
+
+  Applies to:
+    POST /api/admin/upload/image
+    POST /api/admin/upload/pdf
+
+  Limit:        20 uploads per hour per IP
+  File:         server/src/routes/adminRoutes.js
+  Limiter:      uploadLimiter
+
+  Purpose:
+    File uploads consume disk space and processing time. 20 uploads per
+    hour is generous for any real admin workflow. This prevents scripts
+    from filling the server's storage with junk uploads. Note: upload
+    endpoints also require a valid admin session — this is an extra layer.
+
+  Size limits (enforced separately by multer):
+    Images: 5 MB maximum per file
+    PDFs:   50 MB maximum per file
+
+  Error message:
+    "Upload limit reached. You can upload up to 20 files per hour."
+
+--------------------------------------------------------------------------------
+TIER 7 — ADMIN WRITE OPERATIONS
+--------------------------------------------------------------------------------
+
+  Applies to:
+    All POST, PUT, DELETE routes under /api/admin/*
+    (create, update, delete for journals, volumes, issues, articles,
+     authors, keywords, announcements, accounts, trusted domains,
+     reader accounts, bulk expiry)
+
+  Limit:        120 requests per 15 minutes per IP
+  File:         server/src/routes/adminRoutes.js
+  Limiter:      adminWriteLimiter
+
+  Purpose:
+    All write operations already require a valid admin session and a CSRF
+    token. This limit is a backup defense — for example, if a session
+    token were somehow compromised, the attacker still cannot make more
+    than 120 changes in 15 minutes. 120 writes in 15 minutes (8/minute)
+    is more than enough for any realistic admin workflow.
+
+  Note:
+    Admin GET (read) endpoints are NOT subject to this limiter — only
+    POST, PUT, and DELETE routes have it applied. Reads are covered by
+    the global baseline (Tier 1).
+
+  Error message:
+    "Too many write operations. Please slow down and try again shortly."
+
+--------------------------------------------------------------------------------
+ENDPOINTS NOT INDIVIDUALLY RATE LIMITED
+--------------------------------------------------------------------------------
+
+  These endpoints are only covered by the global baseline (Tier 1):
+
+  GET  /api/health
+    Low-risk health check. No data exposed, no side effects.
+
+  GET  /api/auth/reader/verify/:token
+    Tokens are single-use and expire after a short window. Brute-forcing
+    a token is computationally infeasible. The global limit is sufficient.
+
+  POST /api/auth/reader/logout
+  POST /api/admin/auth/logout
+    Logout is a safe, idempotent operation. No abuse risk.
+
+  GET  /api/auth/reader/me
+  GET  /api/admin/auth/me
+    Session check endpoints called on page load. No sensitive data change.
+    The global limit prevents polling abuse.
+
+  POST /api/admin/auth/change-password
+    Requires a valid session, CSRF token, and the current password.
+    Three independent guards make a separate rate limit redundant.
+
+  All admin GET endpoints (list, detail, dashboard, options)
+    Require a valid admin session. The global limit is sufficient.
+
+--------------------------------------------------------------------------------
+RATE LIMIT STORAGE
+--------------------------------------------------------------------------------
+
+  Storage type:   In-memory (per server process)
+  Persistence:    None — counters reset on server restart
+  Multi-instance: Not applicable — the app runs as a single instance.
+                  If multiple instances are ever deployed, a shared store
+                  (e.g. Redis via rate-limit-redis) would be needed to keep
+                  counters consistent across instances.
+
+--------------------------------------------------------------------------------
+QUICK REFERENCE TABLE
+--------------------------------------------------------------------------------
+
+  Tier | Endpoint(s)                    | Limit         | Window  | Key
+  -----+--------------------------------+---------------+---------+---------
+  1    | ALL routes                     | 500 req       | 15 min  | IP
+  2    | Public reads                   | 300 req       | 10 min  | IP
+  3    | PDF downloads                  | 20 req        | 1 hour  | IP
+  4a   | Magic link request             | 5 req         | 1 hour  | IP
+  4b   | Magic link request             | 3 req         | 1 hour  | Email
+  5    | Admin login                    | 15 req        | 15 min  | IP
+  6    | File uploads                   | 20 req        | 1 hour  | IP
+  7    | Admin writes (POST/PUT/DELETE) | 120 req       | 15 min  | IP
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
